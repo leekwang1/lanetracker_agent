@@ -1,22 +1,79 @@
+# 차선 추적기 설정 파일
+
+# 시작점으로부터 최대 몇 m까지 추적할지 설정합니다.
 max_track_length_m: 500.0
+
+# 한 번에 전진하는 거리입니다.
+# 값이 작을수록 더 촘촘하고 안정적이지만 속도는 느려집니다.
 step_m: 0.30
-search_half_width_m: 0.80
+
+# 예측 진행선 기준으로 후보를 탐색할 범위입니다.
+search_half_width_m: 0.60
 search_forward_samples: 5
 search_lateral_samples: 9
+
+# 각 후보 중심 주변에서 점수를 계산할 때 사용할 반경입니다.
 search_radius_m: 0.18
+
+# 점수가 낮아도 차선이 잠깐 끊긴 것으로 보고 계속 전진할 최대 거리입니다.
 max_gap_m: 3.00
+
+# 후보를 정상 추적으로 인정할 최소 점수입니다.
 min_score: 0.32
+
+# 주변 점 탐색을 빠르게 하기 위한 공간 격자 크기입니다.
 grid_size_m: 0.20
+
+# 시작점 주변에서 초기 차선 밝기, 배경, 높이 기준을 만들 때 사용할 반경입니다.
 seed_profile_radius_m: 0.35
+
+# 강도값 보정/확장용 예약 설정입니다.
 intensity_window_quantile_low: 0.55
 intensity_window_quantile_high: 0.98
+
+# 점수 계산 가중치입니다.
 straight_bias_weight: 0.30
 continuity_weight: 0.25
 contrast_weight: 0.20
 intensity_weight: 0.25
-max_heading_change_deg: 22.0
+
+# 한 스텝에서 허용할 최대 방향 변화량입니다.
+max_heading_change_deg: 5.0
+
+# 최종 결과를 평균내어 덜 구불거리게 만드는 스무딩 창 크기입니다.
 smoothing_window: 5
+
+# 높이(Z) 안정성 관련 설정입니다.
 z_tolerance_m: 0.45
+max_z_step_m: 0.12
+z_fit_window_m: 0.18
+hard_max_z_step_m: 0.14
+
+# 차선 중심 유지 관련 설정입니다.
+center_offset_tolerance_m: 0.12
+center_pull_weight: 0.90
+center_refine_radius_m: 0.05
+center_refine_max_shift_m: 0.03
+hard_center_offset_limit_m: 0.14
+
+# 단면 기반 중심 보정 설정입니다.
+lane_half_width_m: 0.09
+cross_section_radius_m: 0.22
+cross_section_forward_window_m: 0.10
+cross_section_bin_size_m: 0.02
+cross_section_stripe_threshold_ratio: 0.35
+cross_section_max_lane_half_width_m: 0.14
+cross_section_center_mix: 0.65
+
+# 방향 안정화 설정입니다.
+direction_history_points: 6
+gap_use_predicted_direction: true
+
+# 추적 중 차선 프로파일을 적응적으로 갱신하는 설정입니다.
 profile_update_radius_m: 0.35
 profile_update_alpha: 0.18
+profile_update_min_score: 0.50
+profile_update_max_lateral_offset_m: 0.06
+
+# 디버그용 JSON 파일 저장 여부입니다.
 save_debug_json: true

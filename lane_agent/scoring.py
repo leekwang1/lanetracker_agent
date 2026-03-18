@@ -92,6 +92,16 @@ def score_candidate(
     z_tolerance = max(float(cfg.get("z_tolerance_m", 0.45)), 1e-3)
     z_term = np.clip(1.0 - abs(z_med - seed_profile.z_ref) / z_tolerance, 0.0, 1.0)
 
+    max_z_step = max(float(cfg.get("max_z_step_m", 0.12)), 1e-3)
+    z_step_term = np.clip(1.0 - abs(candidate_center[2] - prev_center[2]) / max_z_step, 0.0, 1.0)
+
+    prev_dir_xy = unit(prev_dir[:2])
+    pred_xy = prev_center[:2] + prev_dir_xy * step_ref
+    normal_xy = np.array([-prev_dir_xy[1], prev_dir_xy[0]], dtype=np.float64)
+    lateral_offset = abs(float(np.dot(candidate_center[:2] - pred_xy, normal_xy)))
+    lateral_tolerance = max(float(cfg.get("center_offset_tolerance_m", 0.18)), 1e-3)
+    center_term = np.clip(1.0 - lateral_offset / lateral_tolerance, 0.0, 1.0)
+
     score = (
         float(cfg["intensity_weight"]) * intensity_term
         + float(cfg["contrast_weight"]) * contrast_term
@@ -99,4 +109,6 @@ def score_candidate(
         + float(cfg["straight_bias_weight"]) * straight_term
     )
     score *= z_term
+    score *= z_step_term
+    score *= (1.0 - float(cfg.get("center_pull_weight", 0.30))) + float(cfg.get("center_pull_weight", 0.30)) * center_term
     return float(score)
