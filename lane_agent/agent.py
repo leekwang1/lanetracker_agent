@@ -84,6 +84,26 @@ class LaneTrackerAgent:
             return False
         return True
 
+    def _lane_loyalty_term(self, points: List[np.ndarray], candidate_center: np.ndarray, pred_dir: np.ndarray) -> float:
+        history_len = int(self.cfg.get("lane_loyalty_history_points", 8))
+        if len(points) < 3:
+            return 1.0
+
+        hist = np.asarray(points[-history_len:], dtype=np.float64)
+        if hist.shape[0] < 2:
+            return 1.0
+
+        anchor = hist[-1, :2]
+        dir_xy = unit(pred_dir[:2])
+        normal_xy = np.array([-dir_xy[1], dir_xy[0]], dtype=np.float64)
+        lateral_hist = (hist[:, :2] - anchor) @ normal_xy
+        center_bias = float(np.median(lateral_hist))
+        candidate_lateral = float(np.dot(candidate_center[:2] - anchor, normal_xy))
+        loyalty_offset = abs(candidate_lateral - center_bias)
+
+        tolerance = max(float(self.cfg.get("lane_loyalty_tolerance_m", self.cfg.get("center_offset_tolerance_m", 0.18) * 0.75)), 1e-3)
+        return float(np.clip(1.0 - loyalty_offset / tolerance, 0.0, 1.0))
+
     def _candidate_centers(self, center: np.ndarray, direction: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
         direction = unit(direction)
         normal = np.array([-direction[1], direction[0], 0.0], dtype=np.float64)
@@ -291,11 +311,15 @@ class LaneTrackerAgent:
                     seed_profile=profile,
                     cfg=self.cfg,
                 )
+                loyalty_term = self._lane_loyalty_term(points, center3, pred_dir)
+                loyalty_weight = float(self.cfg.get("lane_loyalty_weight", 0.0))
+                sc *= (1.0 - loyalty_weight) + loyalty_weight * loyalty_term
                 candidates_debug.append({
                     "x": float(center3[0]),
                     "y": float(center3[1]),
                     "z": float(center3[2]),
                     "score": float(sc),
+                    "lane_loyalty": float(loyalty_term),
                 })
                 if sc > best_score:
                     best_score = sc
