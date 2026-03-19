@@ -212,13 +212,35 @@ profile_update_min_score: 0.25
 profile_update_max_lateral_offset_m: 0.06
 
 # =========================================================
-# 8. 결과 / 디버그
+# 8. 결과 후처리 보정
 # =========================================================
+
+# [보정] 추적 후 잠깐 옆 점선으로 빠졌다가 다시 돌아온 detour 구간을 보정할지
+enable_post_correction: true
+
+# [보정] 앞뒤 몇 포인트로 기준 진행 방향을 잡을지
+post_correction_window: 20
+
+# [보정] 기준선에서 이 정도 이상 벗어나야 detour 후보로 판단
+post_correction_lateral_threshold_m: 0.05
+
+# [보정] 다시 이 값 아래로 돌아오면 detour 구간이 끝난 것으로 판단
+post_correction_return_threshold_m: 0.02
+
+# [보정] 너무 짧은 구간은 무시하기 위한 최소 길이
+post_correction_min_segment_points: 3
+
+# [보정] 너무 긴 구간은 실제 차선 변화일 수 있어 보정하지 않기 위한 최대 길이
+post_correction_max_segment_points: 20
 
 # [보정] 최종 결과를 이동 평균으로 부드럽게 만드는 창 크기입니다.
 # 추적이 끝난 뒤 적용되는 후처리이므로, 실제 후보 선택에는 직접 영향이 없습니다.
 smoothing_window: 5
 
+# =========================================================
+# 9. 디버그
+# =========================================================
+
 # [디버그] 디버그용 JSON 파일 저장 여부입니다.
 # true면 stop_reason, 후보 점수, 각 step의 상세 정보가 저장됩니다.
-save_debug_json: true
+save_debug_json: false

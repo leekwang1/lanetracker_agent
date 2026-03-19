@@ -31,11 +31,14 @@ def main() -> None:
 
     agent = LaneTrackerAgent(las.xyz, las.intensity, cfg)
     output_path = Path(args.output)
+    post_output_path = output_path.with_name(f"{output_path.stem}_pc{output_path.suffix}")
     debug_path = output_path.with_suffix(output_path.suffix + ".debug.json")
     result = agent.track(p0, p1, str(debug_path))
-    save_xyz_csv(output_path, result.points)
+    save_xyz_csv(output_path, result.raw_points)
+    save_xyz_csv(post_output_path, result.points)
 
-    print(f"Saved CSV: {output_path}")
+    print(f"Saved raw CSV: {output_path}")
+    print(f"Saved post-corrected CSV: {post_output_path}")
     print(f"Stop reason: {result.stop_reason}")
     if cfg.get("save_debug_json", True):
         print(f"Saved debug: {debug_path}")

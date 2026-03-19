@@ -14,6 +14,7 @@ from .scoring import SeedProfile, blend_seed_profile, estimate_seed_profile, sco
 @dataclass
 class TrackResult:
     points: np.ndarray
+    raw_points: np.ndarray
     scores: List[float]
     stop_reason: str
 
@@ -378,7 +379,10 @@ class LaneTrackerAgent:
                 "candidates": candidates_debug,
             })
 
-        arr = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
+        raw_arr = np.vstack(points) if points else np.empty((0, 3), dtype=np.float64)
+        arr = raw_arr.copy()
+        if arr.shape[0] >= 7 and bool(self.cfg.get("enable_post_correction", True)):
+            arr = self._post_correct_detours(arr)
         if arr.shape[0] >= 3 and int(self.cfg.get("smoothing_window", 1)) >= 3:
             arr = self._smooth(arr, int(self.cfg["smoothing_window"]))
 
@@ -386,6 +390,7 @@ class LaneTrackerAgent:
             payload = {
                 "stop_reason": stop_reason,
                 "num_points": int(arr.shape[0]),
+                "num_raw_points": int(raw_arr.shape[0]),
                 "num_steps": int(len(debug_steps)),
                 "gap_steps": int(gap_steps),
                 "scores": scores,
@@ -393,7 +398,74 @@ class LaneTrackerAgent:
             }
             Path(debug_json_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        return TrackResult(points=arr, scores=scores, stop_reason=stop_reason)
+        return TrackResult(points=arr, raw_points=raw_arr, scores=scores, stop_reason=stop_reason)
+
+    def _post_correct_detours(self, pts: np.ndarray) -> np.ndarray:
+        window = int(self.cfg.get("post_correction_window", 4))
+        min_len = int(self.cfg.get("post_correction_min_segment_points", 3))
+        max_len = int(self.cfg.get("post_correction_max_segment_points", 20))
+        lateral_thr = float(self.cfg.get("post_correction_lateral_threshold_m", 0.06))
+        return_thr = float(self.cfg.get("post_correction_return_threshold_m", lateral_thr * 0.5))
+        if pts.shape[0] < (window * 2 + 1):
+            return pts
+
+        residuals = np.zeros(pts.shape[0], dtype=np.float64)
+        signs = np.zeros(pts.shape[0], dtype=np.int32)
+
+        for i in range(window, pts.shape[0] - window):
+            prev_pt = pts[i - window]
+            next_pt = pts[i + window]
+            seg = next_pt[:2] - prev_pt[:2]
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len < 1e-9:
+                continue
+            dir_xy = seg / seg_len
+            normal_xy = np.array([-dir_xy[1], dir_xy[0]], dtype=np.float64)
+            offset = float(np.dot(pts[i, :2] - prev_pt[:2], normal_xy))
+            residuals[i] = offset
+            signs[i] = 1 if offset > 0.0 else (-1 if offset < 0.0 else 0)
+
+        out = pts.copy()
+        i = window
+        while i < pts.shape[0] - window:
+            if abs(residuals[i]) < lateral_thr or signs[i] == 0:
+                i += 1
+                continue
+
+            start = i
+            sign = signs[i]
+            peak = abs(residuals[i])
+            while i < pts.shape[0] - window and signs[i] == sign:
+                peak = max(peak, abs(residuals[i]))
+                if abs(residuals[i]) < return_thr and i > start:
+                    break
+                i += 1
+            end = i if i < pts.shape[0] - window and abs(residuals[i]) < return_thr else (i - 1)
+            seg_len = end - start + 1
+
+            if seg_len < min_len or seg_len > max_len:
+                i = max(i, start + 1)
+                continue
+
+            if peak < lateral_thr:
+                i = max(i, start + 1)
+                continue
+
+            left_idx = start - 1
+            right_idx = end + 1
+            if left_idx < 0 or right_idx >= pts.shape[0]:
+                i = max(i, start + 1)
+                continue
+
+            left_pt = out[left_idx]
+            right_pt = out[right_idx]
+            for j in range(start, end + 1):
+                t = (j - left_idx) / max(right_idx - left_idx, 1)
+                out[j] = (1.0 - t) * left_pt + t * right_pt
+
+            i = right_idx
+
+        return out
 
     def _smooth(self, pts: np.ndarray, window: int) -> np.ndarray:
         if window < 3 or pts.shape[0] < window:
@@ -401,6 +473,9 @@ class LaneTrackerAgent:
         half = window // 2
         out = pts.copy()
         for i in range(pts.shape[0]):
+            if i == 0 or i == pts.shape[0] - 1:
+                out[i] = pts[i]
+                continue
             a = max(0, i - half)
             b = min(pts.shape[0], i + half + 1)
             out[i] = np.mean(pts[a:b], axis=0)
