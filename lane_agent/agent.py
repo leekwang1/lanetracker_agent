@@ -291,6 +291,13 @@ class LaneTrackerAgent:
                 idx = self.grid.query_radius_xy(c_xy, query_r)
                 c_z = self._fit_center_z(c_xy, query_r, cur[2])
                 center3 = np.array([c_xy[0], c_xy[1], c_z], dtype=np.float64)
+                if idx.size > 0:
+                    local_i = self.intensity[idx].astype(np.float64)
+                    mean_intensity = float(np.mean(local_i))
+                    high_intensity = float(np.quantile(local_i, 0.9))
+                else:
+                    mean_intensity = 0.0
+                    high_intensity = 0.0
                 allowed = self._candidate_is_allowed(center3, cur, pred_dir)
                 if not allowed:
                     candidates_debug.append({
@@ -298,6 +305,8 @@ class LaneTrackerAgent:
                         "y": float(center3[1]),
                         "z": float(center3[2]),
                         "score": -1.0,
+                        "mean_intensity": mean_intensity,
+                        "high_intensity": high_intensity,
                         "rejected": "hard_gate",
                     })
                     continue
@@ -320,6 +329,8 @@ class LaneTrackerAgent:
                     "y": float(center3[1]),
                     "z": float(center3[2]),
                     "score": float(sc),
+                    "mean_intensity": mean_intensity,
+                    "high_intensity": high_intensity,
                     "lane_loyalty": float(loyalty_term),
                 })
                 if sc > best_score:
