@@ -8,5 +8,6 @@ __all__ = [
     "live_debug_app",
     "live_debug_controller",
     "live_debug_window",
+    "pointcloud_view_widget",
     "scoring",
 ]

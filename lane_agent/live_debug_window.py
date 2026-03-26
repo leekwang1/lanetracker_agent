@@ -10,9 +10,8 @@ try:
 except Exception:  # pragma: no cover - runtime fallback when dependency is unavailable
     pg = None
 
-from _V2.ui.pointcloud_view_widget import PointCloudViewWidget
-
 from .live_debug_controller import LiveDebugController
+from .pointcloud_view_widget import PointCloudViewWidget
 
 
 class CrossSectionProfileWidget(QtWidgets.QWidget):
