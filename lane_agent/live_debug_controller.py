@@ -69,7 +69,6 @@ class LiveDebugController(QtCore.QObject):
     def load_tracker_config(self, path: str) -> None:
         self.cfg = load_config(path)
         self.cfg_path = str(path)
-        self.agent = None
         self.session = None
         self.model.track_points = None
         self.model.current_point = None
@@ -101,7 +100,7 @@ class LiveDebugController(QtCore.QObject):
             raise RuntimeError("Config must be loaded first.")
         if self.model.p0 is None or self.model.p1 is None:
             raise RuntimeError("P0 and P1 are required.")
-        self.agent = LaneTrackerAgent(self.las.xyz, self.las.intensity, self.cfg)
+        grid_reused = self._ensure_agent()
         self.session = self.agent.initialize_session(self.model.p0, self.model.p1)
         self.model.track_points = np.asarray(self.session.points, dtype=np.float64)
         self.model.current_point = self.session.cur.copy()
@@ -110,10 +109,15 @@ class LiveDebugController(QtCore.QObject):
         self.model.candidate_rows = []
         self.model.score_history = list(self.session.scores)
         self.model.latest_step = None
-        self.model.cross_section_profile = self.agent._analyze_cross_section_profile(self.session.cur, self.session.cur_dir)
+        self.model.cross_section_profile = self.agent._analyze_cross_section_profile(
+            self.session.cur,
+            self.session.cur_dir,
+            self.session.profile,
+        )
         mode = "finished" if self.session.finished else "ready"
-        self.model.status_text = f"Initialized | mode={mode} | accepted={len(self.session.points)}"
-        self.log_message.emit("Tracker initialized")
+        grid_state = "reused" if grid_reused else "rebuilt"
+        self.model.status_text = f"Initialized | mode={mode} | accepted={len(self.session.points)} | grid={grid_state}"
+        self.log_message.emit(f"Tracker initialized | grid={grid_state}")
         self.changed.emit()
 
     def run_step(self) -> TrackStepDebug:
@@ -172,7 +176,6 @@ class LiveDebugController(QtCore.QObject):
         self.changed.emit()
 
     def reset(self) -> None:
-        self.agent = None
         self.session = None
         self.model.track_points = None
         self.model.current_point = None
@@ -185,6 +188,23 @@ class LiveDebugController(QtCore.QObject):
         self.model.status_text = "Reset"
         self.log_message.emit("Reset")
         self.changed.emit()
+
+    def _ensure_agent(self) -> bool:
+        if self.las is None or self.cfg is None:
+            raise RuntimeError("LAS and config must be loaded before agent creation.")
+
+        grid_size = float(self.cfg["grid_size_m"])
+        if (
+            self.agent is not None
+            and self.agent.xyz is self.las.xyz
+            and self.agent.intensity is self.las.intensity
+            and abs(float(self.agent.grid.cell_size) - grid_size) <= 1e-12
+        ):
+            self.agent.cfg = self.cfg
+            return True
+
+        self.agent = LaneTrackerAgent(self.las.xyz, self.las.intensity, self.cfg)
+        return False
 
     def _sync_model_from_step(self, step: TrackStepDebug) -> None:
         assert self.session is not None
@@ -229,9 +249,10 @@ class LiveDebugController(QtCore.QObject):
             self.log_message.emit(f"top_candidates={top_text}")
 
     def _build_candidate_points(self, rows: list[dict[str, Any]]) -> np.ndarray | None:
-        if not rows:
+        visible_rows = self._visible_candidate_rows(rows)
+        if not visible_rows:
             return None
-        pts = np.array([[float(row["x"]), float(row["y"]), float(row["z"])] for row in rows], dtype=np.float64)
+        pts = np.array([[float(row["x"]), float(row["y"]), float(row["z"])] for row in visible_rows], dtype=np.float64)
         return pts if pts.size else None
 
     def _build_candidate_box(
@@ -240,7 +261,8 @@ class LiveDebugController(QtCore.QObject):
         predicted_direction: np.ndarray | None,
         rows: list[dict[str, Any]],
     ) -> np.ndarray | None:
-        if predicted_direction is None or not rows:
+        visible_rows = self._visible_candidate_rows(rows)
+        if predicted_direction is None or not visible_rows:
             return None
         dir_xy = np.asarray(predicted_direction[:2], dtype=np.float64)
         norm = float(np.linalg.norm(dir_xy))
@@ -248,7 +270,7 @@ class LiveDebugController(QtCore.QObject):
             return None
         dir_xy = dir_xy / norm
         normal_xy = np.array([-dir_xy[1], dir_xy[0]], dtype=np.float64)
-        pts = np.array([[float(row["x"]), float(row["y"])] for row in rows], dtype=np.float64)
+        pts = np.array([[float(row["x"]), float(row["y"])] for row in visible_rows], dtype=np.float64)
         along = pts @ dir_xy
         lateral = pts @ normal_xy
         along_min = float(np.min(along))
@@ -271,6 +293,12 @@ class LiveDebugController(QtCore.QObject):
             ]
         )
         return corners
+
+    def _visible_candidate_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        allowed_rows = [row for row in rows if not row.get("rejected")]
+        return allowed_rows if allowed_rows else list(rows)
 
     def _sort_candidate_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ranked = list(rows)

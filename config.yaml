@@ -164,6 +164,12 @@ cross_section_max_lane_half_width_m: 0.14
 # [보정] 단면 stripe의 기하학적 중심과 가중 중심을 얼마나 섞을지 정합니다.
 # 1.0이면 stripe 폭의 정중앙, 0.0이면 밝기 가중 중심만 사용합니다.
 cross_section_center_mix: 0.65
+cross_section_peak_min_ratio: 0.20
+cross_section_peak_min_separation_m: 0.05
+cross_section_peak_weight: 0.15
+cross_section_loyalty_weight: 0.60
+cross_section_signal_similarity_weight: 0.25
+cross_section_loyalty_tolerance_m: 0.08
 
 # =========================================================
 # 6. 방향 안정화 / 차선 유지 성향

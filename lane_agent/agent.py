@@ -27,6 +27,12 @@ class TrackStripeDebug:
     weighted_center_m: float
     peak_value: float
     active_threshold: float
+    mean_intensity: float = 0.0
+    high_intensity: float = 0.0
+    center_term: float = 1.0
+    signal_term: float = 1.0
+    peak_term: float = 1.0
+    selection_score: float = 1.0
 
 
 @dataclass
@@ -135,9 +141,9 @@ class LaneTrackerAgent:
             return step
 
         best_center = self._refine_center_xy(best_center, best_dir)
-        best_center = self._refine_centerline_cross_section(best_center, best_dir)
+        best_center = self._refine_centerline_cross_section(best_center, best_dir, session.profile)
         best_center[2] = self._fit_center_z(best_center[:2], session.query_r, session.cur[2])
-        cross_section_profile = self._analyze_cross_section_profile(best_center, best_dir)
+        cross_section_profile = self._analyze_cross_section_profile(best_center, best_dir, session.profile)
 
         if best_score < session.min_score:
             next_gap_accum = session.gap_accum + session.step_m
@@ -392,10 +398,105 @@ class LaneTrackerAgent:
         refined[:2] = refined[:2] + normal * shift
         return refined
 
+    def _build_cross_section_stripe(
+        self,
+        lateral: np.ndarray,
+        vals: np.ndarray,
+        weights: np.ndarray,
+        edges: np.ndarray,
+        smooth_hist: np.ndarray,
+        peak_idx: int,
+        peak_value_max: float,
+        lane_half: float,
+        seed_profile: SeedProfile | None,
+    ) -> TrackStripeDebug | None:
+        stripe_ratio = float(self.cfg.get("cross_section_stripe_threshold_ratio", 0.35))
+        active_threshold = float(smooth_hist[peak_idx]) * stripe_ratio
+        left_idx = peak_idx
+        right_idx = peak_idx
+        while left_idx > 0 and smooth_hist[left_idx - 1] >= active_threshold:
+            left_idx -= 1
+        while right_idx < smooth_hist.size - 1 and smooth_hist[right_idx + 1] >= active_threshold:
+            right_idx += 1
+
+        stripe_left = float(edges[left_idx])
+        stripe_right = float(edges[right_idx + 1])
+        stripe_center = 0.5 * (stripe_left + stripe_right)
+
+        stripe_half_width_limit = float(self.cfg.get("cross_section_max_lane_half_width_m", lane_half * 1.6))
+        stripe_half_width = 0.5 * (stripe_right - stripe_left)
+        if stripe_half_width > stripe_half_width_limit:
+            stripe_left = stripe_center - stripe_half_width_limit
+            stripe_right = stripe_center + stripe_half_width_limit
+
+        in_stripe = (lateral >= stripe_left) & (lateral <= stripe_right)
+        if np.count_nonzero(in_stripe) < 4:
+            return None
+
+        stripe_weights = weights[in_stripe]
+        stripe_lateral = lateral[in_stripe]
+        stripe_vals = vals[in_stripe]
+        weight_sum = float(np.sum(stripe_weights))
+        if weight_sum <= 1e-9:
+            return None
+
+        weighted_center = float(np.sum(stripe_lateral * stripe_weights) / weight_sum)
+        mean_intensity = float(np.mean(stripe_vals))
+        high_intensity = float(np.quantile(stripe_vals, 0.90))
+
+        center_mix = float(self.cfg.get("cross_section_center_mix", 0.65))
+        refined_center = (center_mix * stripe_center) + ((1.0 - center_mix) * weighted_center)
+
+        loyalty_tolerance = max(
+            float(
+                self.cfg.get(
+                    "cross_section_loyalty_tolerance_m",
+                    self.cfg.get("lane_loyalty_tolerance_m", self.cfg.get("center_offset_tolerance_m", 0.18)),
+                )
+            ),
+            1e-3,
+        )
+        center_term = float(np.clip(1.0 - abs(refined_center) / loyalty_tolerance, 0.0, 1.0))
+        peak_term = float(np.clip(float(smooth_hist[peak_idx]) / max(peak_value_max, 1e-9), 0.0, 1.0))
+
+        signal_term = 1.0
+        if seed_profile is not None:
+            seed_signal = max(seed_profile.target_intensity - seed_profile.background_intensity, 1.0)
+            stripe_background = float(np.quantile(stripe_vals, 0.35))
+            stripe_signal = max(high_intensity - stripe_background, 0.0)
+            target_similarity = np.clip(1.0 - abs(high_intensity - seed_profile.target_intensity) / seed_signal, 0.0, 1.0)
+            signal_similarity = np.clip(1.0 - abs(stripe_signal - seed_signal) / seed_signal, 0.0, 1.0)
+            mean_similarity = np.clip(1.0 - abs(mean_intensity - seed_profile.target_intensity) / max(seed_signal * 1.25, 1.0), 0.0, 1.0)
+            signal_term = float(0.6 * target_similarity + 0.3 * signal_similarity + 0.1 * mean_similarity)
+
+        peak_weight = float(self.cfg.get("cross_section_peak_weight", 0.15))
+        center_weight = float(self.cfg.get("cross_section_loyalty_weight", 0.60))
+        signal_weight = float(self.cfg.get("cross_section_signal_similarity_weight", 0.25))
+        weight_total = max(peak_weight + center_weight + signal_weight, 1e-9)
+        selection_score = float(
+            (peak_weight * peak_term + center_weight * center_term + signal_weight * signal_term) / weight_total
+        )
+
+        return TrackStripeDebug(
+            left_m=float(stripe_left),
+            right_m=float(stripe_right),
+            center_m=float(stripe_center),
+            weighted_center_m=float(weighted_center),
+            peak_value=float(smooth_hist[peak_idx]),
+            active_threshold=float(active_threshold),
+            mean_intensity=mean_intensity,
+            high_intensity=high_intensity,
+            center_term=center_term,
+            signal_term=signal_term,
+            peak_term=peak_term,
+            selection_score=selection_score,
+        )
+
     def _analyze_cross_section_profile(
         self,
         center: np.ndarray,
         direction: np.ndarray,
+        seed_profile: SeedProfile | None = None,
     ) -> TrackCrossSectionProfileDebug | None:
         radius = float(self.cfg.get("cross_section_radius_m", max(self.cfg["search_half_width_m"], self.cfg["search_radius_m"])))
         idx = self.grid.query_radius_xy(center[:2], radius)
@@ -447,52 +548,74 @@ class LaneTrackerAgent:
         if peak_value <= 1e-9:
             return None
 
-        stripe_ratio = float(self.cfg.get("cross_section_stripe_threshold_ratio", 0.35))
-        active_threshold = peak_value * stripe_ratio
-        left_idx = peak_idx
-        right_idx = peak_idx
-        while left_idx > 0 and smooth_hist[left_idx - 1] >= active_threshold:
-            left_idx -= 1
-        while right_idx < smooth_hist.size - 1 and smooth_hist[right_idx + 1] >= active_threshold:
-            right_idx += 1
+        peak_min_ratio = float(self.cfg.get("cross_section_peak_min_ratio", 0.20))
+        peak_min_separation = float(self.cfg.get("cross_section_peak_min_separation_m", max(bin_size * 2.0, lane_half * 0.5)))
+        peak_min_bins = max(int(np.ceil(peak_min_separation / bin_size)), 1)
 
-        stripe_left = float(edges[left_idx])
-        stripe_right = float(edges[right_idx + 1])
-        stripe_center = 0.5 * (stripe_left + stripe_right)
+        peak_indices: list[int] = []
+        for idx_peak in range(smooth_hist.size):
+            left_val = float(smooth_hist[idx_peak - 1]) if idx_peak > 0 else -np.inf
+            right_val = float(smooth_hist[idx_peak + 1]) if idx_peak < smooth_hist.size - 1 else -np.inf
+            cur_val = float(smooth_hist[idx_peak])
+            if cur_val < peak_value * peak_min_ratio:
+                continue
+            if cur_val + 1e-12 < left_val or cur_val + 1e-12 < right_val:
+                continue
+            peak_indices.append(idx_peak)
+        if not peak_indices:
+            peak_indices = [peak_idx]
 
-        stripe_half_width_limit = float(self.cfg.get("cross_section_max_lane_half_width_m", lane_half * 1.6))
-        stripe_half_width = 0.5 * (stripe_right - stripe_left)
-        if stripe_half_width > stripe_half_width_limit:
-            stripe_left = stripe_center - stripe_half_width_limit
-            stripe_right = stripe_center + stripe_half_width_limit
+        kept_peaks: list[int] = []
+        for idx_peak in sorted(peak_indices, key=lambda item: float(smooth_hist[item]), reverse=True):
+            if any(abs(idx_peak - existing) < peak_min_bins for existing in kept_peaks):
+                continue
+            kept_peaks.append(idx_peak)
 
-        in_stripe = (lateral >= stripe_left) & (lateral <= stripe_right)
-        if np.count_nonzero(in_stripe) < 4:
+        stripe_candidates: list[TrackStripeDebug] = []
+        seen_spans: set[tuple[int, int]] = set()
+        for idx_peak in kept_peaks:
+            stripe = self._build_cross_section_stripe(
+                lateral=lateral,
+                vals=vals,
+                weights=weights,
+                edges=edges,
+                smooth_hist=smooth_hist,
+                peak_idx=idx_peak,
+                peak_value_max=peak_value,
+                lane_half=lane_half,
+                seed_profile=seed_profile,
+            )
+            if stripe is None:
+                continue
+            span_key = (
+                int(round(stripe.left_m / bin_size)),
+                int(round(stripe.right_m / bin_size)),
+            )
+            if span_key in seen_spans:
+                continue
+            seen_spans.add(span_key)
+            stripe_candidates.append(stripe)
+        if not stripe_candidates:
             return None
 
-        stripe_weights = weights[in_stripe]
-        stripe_lateral = lateral[in_stripe]
-        weighted_center = float(np.sum(stripe_lateral * stripe_weights) / np.sum(stripe_weights))
+        stripe_candidates.sort(key=lambda stripe: stripe.selection_score, reverse=True)
 
         bins_center = 0.5 * (edges[:-1] + edges[1:])
-        stripe = TrackStripeDebug(
-            left_m=float(stripe_left),
-            right_m=float(stripe_right),
-            center_m=float(stripe_center),
-            weighted_center_m=float(weighted_center),
-            peak_value=float(peak_value),
-            active_threshold=float(active_threshold),
-        )
         return TrackCrossSectionProfileDebug(
             bins_center=np.asarray(bins_center, dtype=np.float64),
             hist_combined=np.asarray(hist, dtype=np.float64),
             smooth_hist=np.asarray(smooth_hist, dtype=np.float64),
             selected_idx=0,
-            stripe_candidates=[stripe],
+            stripe_candidates=stripe_candidates,
         )
 
-    def _refine_centerline_cross_section(self, center: np.ndarray, direction: np.ndarray) -> np.ndarray:
-        profile = self._analyze_cross_section_profile(center, direction)
+    def _refine_centerline_cross_section(
+        self,
+        center: np.ndarray,
+        direction: np.ndarray,
+        seed_profile: SeedProfile | None = None,
+    ) -> np.ndarray:
+        profile = self._analyze_cross_section_profile(center, direction, seed_profile)
         if profile is None or profile.selected_idx is None or not profile.stripe_candidates:
             return center
 
@@ -651,6 +774,12 @@ class LaneTrackerAgent:
                     "weighted_center_m": float(stripe.weighted_center_m),
                     "peak_value": float(stripe.peak_value),
                     "active_threshold": float(stripe.active_threshold),
+                    "mean_intensity": float(stripe.mean_intensity),
+                    "high_intensity": float(stripe.high_intensity),
+                    "center_term": float(stripe.center_term),
+                    "signal_term": float(stripe.signal_term),
+                    "peak_term": float(stripe.peak_term),
+                    "selection_score": float(stripe.selection_score),
                 }
                 for stripe in profile.stripe_candidates
             ],
