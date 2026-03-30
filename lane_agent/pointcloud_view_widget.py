@@ -68,6 +68,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
         self._detail_mid_area_ratio = 1.0
         self._detail_full_area_ratio = 1.0
         self._raw_full_area_ratio = 1.0
+        self._overlay_z_offset_m = 0.08
         self._log_visible_refresh = False
         self._view_rect_cache: tuple[float, float, float, float] | None = None
 
@@ -278,6 +279,27 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             except Exception as exc:
                 self.debug_message.emit(f"raise overlay failed for {actor_name}: {exc!r}")
 
+    def _to_local_xyz(self, points: np.ndarray | None) -> np.ndarray | None:
+        if points is None:
+            return None
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim == 1:
+            if pts.shape[0] == 2:
+                pts = np.array([[pts[0], pts[1], 0.0]], dtype=np.float64)
+            else:
+                pts = pts[None, :]
+        if pts.shape[1] == 2:
+            pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
+        return pts - self._origin_xyz[None, :]
+
+    def _to_overlay_local_xyz(self, points: np.ndarray | None) -> np.ndarray | None:
+        pts = self._to_local_xyz(points)
+        if pts is None:
+            return None
+        pts = np.array(pts, dtype=np.float64, copy=True)
+        pts[:, 2] += self._overlay_z_offset_m
+        return pts
+
     def focus_on_point(self, point_xyz: np.ndarray | None, view_width_m: float = 9.0) -> None:
         if self.plotter is None or point_xyz is None:
             return
@@ -312,10 +334,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             if render:
                 self.plotter.render()
             return
-        pts = np.asarray(points, dtype=np.float64)
-        if pts.shape[1] == 2:
-            pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-        pts = pts - self._origin_xyz[None, :]
+        pts = self._to_overlay_local_xyz(points)
         self._track_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
         self._track_actor = self.plotter.add_mesh(
             self._track_poly,
@@ -324,6 +343,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             render_lines_as_tubes=False,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if self._log_visible_refresh:
             self.debug_message.emit(
                 f"set_track | n={self._poly_point_count(self._track_poly)} | {self._poly_bounds_text(self._track_poly)}"
@@ -347,11 +367,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
 
         p0a = np.asarray(p0, dtype=np.float64)
         p1a = np.asarray(p1, dtype=np.float64)
-        if p0a.shape[0] == 2:
-            p0a = np.array([p0a[0], p0a[1], 0.0], dtype=np.float64)
-        if p1a.shape[0] == 2:
-            p1a = np.array([p1a[0], p1a[1], 0.0], dtype=np.float64)
-        pts = np.vstack([p0a, p1a]) - self._origin_xyz[None, :]
+        pts = self._to_overlay_local_xyz(np.vstack([p0a, p1a]))
 
         self._seed_line_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
         self._seed_line_actor = self.plotter.add_mesh(
@@ -377,6 +393,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             point_size=12,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if render:
             self.plotter.render()
 
@@ -390,11 +407,8 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             if render:
                 self.plotter.render()
             return
-        point = np.asarray(p, dtype=np.float64)
-        if point.shape[0] == 2:
-            point = np.array([point[0], point[1], 0.0], dtype=np.float64)
-        point = point - self._origin_xyz
-        self._current_poly = pv.PolyData(point[None, :].astype(np.float32, copy=False))
+        point = self._to_overlay_local_xyz(p)
+        self._current_poly = pv.PolyData(point.astype(np.float32, copy=False))
         self._current_actor = self.plotter.add_points(
             self._current_poly,
             color="#ef4444",
@@ -402,6 +416,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             point_size=12,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if self._log_visible_refresh:
             self.debug_message.emit(
                 f"set_current | n={self._poly_point_count(self._current_poly)} | {self._poly_bounds_text(self._current_poly)}"
@@ -420,10 +435,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             if render:
                 self.plotter.render()
             return
-        points = np.asarray(pts, dtype=np.float64)
-        if points.shape[1] == 2:
-            points = np.column_stack([points, np.zeros(len(points), dtype=np.float64)])
-        points = points - self._origin_xyz[None, :]
+        points = self._to_overlay_local_xyz(pts)
         self._pred_poly = pv.PolyData(points.astype(np.float32, copy=False))
         self._pred_actor = self.plotter.add_points(
             self._pred_poly,
@@ -433,6 +445,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             opacity=0.7,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if self._log_visible_refresh:
             self.debug_message.emit(
                 f"set_predicted | n={self._poly_point_count(self._pred_poly)} | {self._poly_bounds_text(self._pred_poly)}"
@@ -458,10 +471,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
                 setattr(self, actor_name, None)
 
         if profile_line is not None and np.asarray(profile_line).size:
-            pts = np.asarray(profile_line, dtype=np.float64)
-            if pts.shape[1] == 2:
-                pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-            pts = pts - self._origin_xyz[None, :]
+            pts = self._to_overlay_local_xyz(profile_line)
             self._profile_line_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
             self._profile_line_actor = self.plotter.add_mesh(
                 self._profile_line_poly,
@@ -472,10 +482,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             )
 
         if stripe_segment is not None and np.asarray(stripe_segment).size:
-            pts = np.asarray(stripe_segment, dtype=np.float64)
-            if pts.shape[1] == 2:
-                pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-            pts = pts - self._origin_xyz[None, :]
+            pts = self._to_overlay_local_xyz(stripe_segment)
             self._stripe_segment_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
             self._stripe_segment_actor = self.plotter.add_mesh(
                 self._stripe_segment_poly,
@@ -486,10 +493,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             )
 
         if stripe_edges is not None and np.asarray(stripe_edges).size:
-            pts = np.asarray(stripe_edges, dtype=np.float64)
-            if pts.shape[1] == 2:
-                pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-            pts = pts - self._origin_xyz[None, :]
+            pts = self._to_overlay_local_xyz(stripe_edges)
             self._stripe_edge_poly = pv.PolyData(pts.astype(np.float32, copy=False))
             self._stripe_edge_actor = self.plotter.add_points(
                 self._stripe_edge_poly,
@@ -499,6 +503,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
                 reset_camera=False,
             )
 
+        self._raise_overlay_actors()
         if render:
             self.plotter.render()
 
@@ -512,10 +517,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             if render:
                 self.plotter.render()
             return
-        pts = np.asarray(line_points, dtype=np.float64)
-        if pts.shape[1] == 2:
-            pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-        pts = pts - self._origin_xyz[None, :]
+        pts = self._to_overlay_local_xyz(line_points)
         self._trajectory_line_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
         self._trajectory_line_actor = self.plotter.add_mesh(
             self._trajectory_line_poly,
@@ -525,6 +527,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             render_lines_as_tubes=False,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if render:
             self.plotter.render()
 
@@ -538,10 +541,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             if render:
                 self.plotter.render()
             return
-        pts = np.asarray(box_points, dtype=np.float64)
-        if pts.shape[1] == 2:
-            pts = np.column_stack([pts, np.zeros(len(pts), dtype=np.float64)])
-        pts = pts - self._origin_xyz[None, :]
+        pts = self._to_overlay_local_xyz(box_points)
         self._search_box_poly = pv.lines_from_points(pts.astype(np.float32, copy=False), close=False)
         self._search_box_actor = self.plotter.add_mesh(
             self._search_box_poly,
@@ -551,6 +551,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             render_lines_as_tubes=False,
             reset_camera=False,
         )
+        self._raise_overlay_actors()
         if self._log_visible_refresh:
             self.debug_message.emit(
                 f"set_search_box | n={self._poly_point_count(self._search_box_poly)} | {self._poly_bounds_text(self._search_box_poly)}"
