@@ -237,7 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_step.clicked.connect(self.on_step)
         btn_full.clicked.connect(self.on_full)
         btn_save.clicked.connect(self.on_save)
-        btn_reset.clicked.connect(self.controller.reset)
+        btn_reset.clicked.connect(self.on_reset)
         self.controller.changed.connect(self.refresh)
         self.controller.log_message.connect(self.log.appendPlainText)
         self.view.point_context_menu_requested.connect(self._open_point_context_menu)
@@ -323,8 +323,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.controller.set_output_path(self.output_edit.text().strip())
             self.controller.initialize_tracker()
 
+        self.log.clear()
         if self._run_action("Initializing tracker...", init_action):
             self.view.focus_on_point(self.controller.model.current_point)
+
+    def on_reset(self) -> None:
+        self.log.clear()
+        self._run_action("Resetting tracker...", self.controller.reset)
 
     def on_step(self) -> None:
         if self._run_action("Running one step...", self.controller.run_step):
