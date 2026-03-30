@@ -326,6 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.clear()
         if self._run_action("Initializing tracker...", init_action):
             self.view.focus_on_point(self.controller.model.current_point)
+            self._refresh_view_overlays()
 
     def on_reset(self) -> None:
         self.log.clear()
@@ -334,10 +335,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_step(self) -> None:
         if self._run_action("Running one step...", self.controller.run_step):
             self.view.focus_on_point(self.controller.model.current_point)
+            self._refresh_view_overlays()
 
     def on_full(self) -> None:
         if self._run_action("Running full tracker...", self.controller.run_full):
             self.view.focus_on_point(self.controller.model.current_point)
+            self._refresh_view_overlays()
 
     def on_save(self) -> None:
         self.controller.set_output_path(self.output_edit.text().strip())
@@ -387,6 +390,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.appendPlainText(f"ERROR: {message}")
         self.status.setText("Error")
         QtWidgets.QMessageBox.critical(self, "Lane Agent Live Debugger", message)
+
+    def _refresh_view_overlays(self) -> None:
+        model = self.controller.model
+        self.view.set_seed_points(model.p0, model.p1, render=False)
+        self.view.set_track(model.track_points, render=False)
+        self.view.set_current(model.current_point, render=False)
+        self.view.set_predicted(model.predicted_points, render=False)
+        self.view.set_profile_overlay(None, None, None, render=False)
+        self.view.set_search_box(model.search_box_points, render=False)
+        self.view.render()
 
     def _open_point_context_menu(self, point_xyz, global_pos) -> None:
         menu = QtWidgets.QMenu(self)

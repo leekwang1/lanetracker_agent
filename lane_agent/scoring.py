@@ -63,6 +63,7 @@ def score_candidate(
     indices: np.ndarray,
     seed_profile: SeedProfile,
     cfg: Dict[str, float],
+    step_reference_m: float | None = None,
 ) -> float:
     if indices.size < 6:
         return -1.0
@@ -83,7 +84,8 @@ def score_candidate(
 
     continuity_dist = float(np.linalg.norm(candidate_center[:2] - prev_center[:2]))
     step_ref = max(float(cfg["step_m"]), 1e-6)
-    continuity_term = np.clip(1.0 - abs(continuity_dist - step_ref) / max(step_ref, 0.15), 0.0, 1.0)
+    continuity_ref = max(float(step_reference_m) if step_reference_m is not None else step_ref, 1e-6)
+    continuity_term = np.clip(1.0 - abs(continuity_dist - continuity_ref) / max(continuity_ref, 0.15), 0.0, 1.0)
 
     heading_change = abs(signed_angle_deg(prev_dir, candidate_dir))
     max_heading = max(float(cfg["max_heading_change_deg"]), 1.0)
@@ -96,7 +98,7 @@ def score_candidate(
     z_step_term = np.clip(1.0 - abs(candidate_center[2] - prev_center[2]) / max_z_step, 0.0, 1.0)
 
     prev_dir_xy = unit(prev_dir[:2])
-    pred_xy = prev_center[:2] + prev_dir_xy * step_ref
+    pred_xy = prev_center[:2] + prev_dir_xy * continuity_ref
     normal_xy = np.array([-prev_dir_xy[1], prev_dir_xy[0]], dtype=np.float64)
     lateral_offset = abs(float(np.dot(candidate_center[:2] - pred_xy, normal_xy)))
     lateral_tolerance = max(float(cfg.get("center_offset_tolerance_m", 0.18)), 1e-3)

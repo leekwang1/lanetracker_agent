@@ -54,6 +54,45 @@ min_score: 0.25
 # [탐색] 주변 점 탐색을 빠르게 하기 위한 공간 격자 크기입니다.
 # 보통 search_radius_m와 비슷한 수준이 무난합니다.
 grid_size_m: 0.22
+candidate_center_half_width_m: 0.12
+candidate_curve_half_width_m: 0.09
+candidate_recovery_half_width_m: 0.16
+curve_candidate_heading_step_deg: 2.5
+curve_candidate_heading_max_deg: 5.0
+curve_candidate_score_scale: 0.99
+recovery_score_trigger: 0.55
+recovery_candidate_heading_step_deg: 4.5
+recovery_candidate_heading_max_deg: 13.5
+recovery_forward_max_distance_m: 3.5
+recovery_hold_distance_m: 10.0
+recovery_force_straight_direction: true
+recovery_heading_levels: 3
+recovery_release_score: 0.60
+recovery_release_steps: 2
+recovery_release_stripe_score: 0.62
+recovery_release_center_limit_m: 0.08
+recovery_release_on_capture: true
+recovery_hard_center_offset_limit_m: 0.63
+recovery_advance_max_scale: 1.0
+recovery_turn_max_deg: 12.0
+recovery_lateral_snap_max_m: 0.10
+recovery_lateral_snap_ratio: 0.55
+recovery_center_pull_weight: 0.15
+recovery_lane_loyalty_weight: 0.10
+recovery_straight_bias_weight: 0.08
+recovery_scoring_heading_deg: 13.5
+recovery_hook_score: 0.50
+recovery_hook_stripe_score: 0.58
+recovery_hook_center_limit_m: 0.10
+recovery_hook_turn_max_deg: 18.0
+recovery_hook_lateral_snap_max_m: 0.18
+recovery_hook_lateral_snap_ratio: 0.85
+recovery_capture_snap_distance_m: 1.50
+recovery_capture_advance_scale: 1.75
+recovery_capture_lateral_snap_max_m: 0.45
+recovery_capture_lateral_snap_ratio: 1.00
+recovery_capture_center_shift_max_m: 0.18
+recovery_candidate_score_scale: 0.97
 
 # [탐색] 시작점 주변에서 초기 차선 프로파일(밝기, 배경, 높이 기준)을 만들 때 사용할 반경입니다.
 # 시작점을 얼마나 대표적인 차선 위에 찍었는지가 이 값의 영향에 크게 좌우됩니다.

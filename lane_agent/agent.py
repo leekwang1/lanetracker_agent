@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 
 from .grid import SpatialGrid
-from .scoring import SeedProfile, blend_seed_profile, estimate_seed_profile, score_candidate, unit
+from .scoring import SeedProfile, blend_seed_profile, estimate_seed_profile, score_candidate, signed_angle_deg, unit
 
 
 @dataclass
@@ -81,6 +81,20 @@ class TrackSession:
     step_index: int = 0
     finished: bool = False
     latest_step: TrackStepDebug | None = None
+    recovery_hold_until_traveled: float = 0.0
+    recovery_lock_dir: np.ndarray | None = None
+    recovery_release_streak: int = 0
+
+
+@dataclass
+class CandidateProposal:
+    center_xy: np.ndarray
+    direction: np.ndarray
+    kind: str
+    step_distance_m: float
+    heading_delta_deg: float = 0.0
+    lateral_offset_m: float = 0.0
+    score_scale: float = 1.0
 
 
 class LaneTrackerAgent:
@@ -123,7 +137,7 @@ class LaneTrackerAgent:
         if session.finished:
             raise RuntimeError(f"Tracking session already finished: {session.stop_reason or 'completed'}")
 
-        pred_dir, best_score, best_center, best_dir, candidates_debug = self._evaluate_step_candidates(session)
+        pred_dir, best_score, best_center, best_dir, best_proposal, candidates_debug = self._evaluate_step_candidates(session)
         if best_center is None or best_dir is None:
             session.stop_reason = "no_candidate"
             session.finished = True
@@ -143,10 +157,27 @@ class LaneTrackerAgent:
         best_center = self._refine_center_xy(best_center, best_dir)
         best_center = self._refine_centerline_cross_section(best_center, best_dir, session.profile)
         best_center[2] = self._fit_center_z(best_center[:2], session.query_r, session.cur[2])
+        pre_steer_profile = self._analyze_cross_section_profile(best_center, best_dir, session.profile)
+        hook_ready = self._recovery_hook_ready(
+            float(best_score),
+            None if best_proposal is None else best_proposal.kind,
+            pre_steer_profile,
+        )
+        best_center, best_dir = self._apply_recovery_steering(
+            session,
+            best_center,
+            best_dir,
+            best_proposal,
+            float(best_score),
+            hook_ready,
+            pre_steer_profile,
+        )
+        best_center[2] = self._fit_center_z(best_center[:2], session.query_r, session.cur[2])
         cross_section_profile = self._analyze_cross_section_profile(best_center, best_dir, session.profile)
 
+        move_distance = float(np.linalg.norm(best_center[:2] - session.cur[:2]))
         if best_score < session.min_score:
-            next_gap_accum = session.gap_accum + session.step_m
+            next_gap_accum = session.gap_accum + move_distance
             next_gap_steps = session.gap_steps + 1
             if next_gap_accum > session.max_gap:
                 session.gap_accum = next_gap_accum
@@ -169,9 +200,16 @@ class LaneTrackerAgent:
 
             session.gap_accum = next_gap_accum
             session.gap_steps = next_gap_steps
+            prev_gap_center = session.cur.copy()
             session.cur = best_center
             session.cur_dir = pred_dir if bool(self.cfg.get("gap_use_predicted_direction", True)) else best_dir
-            session.traveled += session.step_m
+            session.traveled += float(np.linalg.norm(session.cur[:2] - prev_gap_center[:2]))
+            self._update_recovery_hold(
+                session,
+                accepted_score=None,
+                accepted_kind=None if best_proposal is None else best_proposal.kind,
+                reacquired=False,
+            )
             if session.traveled >= session.max_len:
                 session.stop_reason = "max_length_reached"
                 session.finished = True
@@ -190,6 +228,7 @@ class LaneTrackerAgent:
             return step
 
         session.gap_accum = 0.0
+        session.gap_steps = 0
         prev_center_for_update = session.cur.copy()
         prev_dir_for_update = pred_dir.copy()
         session.cur = best_center
@@ -212,6 +251,18 @@ class LaneTrackerAgent:
             session.traveled += float(np.linalg.norm(session.points[-1][:2] - session.points[-2][:2]))
         else:
             session.traveled += session.step_m
+        accepted_kind = None if best_proposal is None else best_proposal.kind
+        reacquired = self._recovery_reacquired(
+            float(best_score),
+            accepted_kind,
+            cross_section_profile,
+        )
+        self._update_recovery_hold(
+            session,
+            accepted_score=float(best_score),
+            accepted_kind=accepted_kind,
+            reacquired=reacquired,
+        )
         if session.traveled >= session.max_len:
             session.stop_reason = "max_length_reached"
             session.finished = True
@@ -295,13 +346,25 @@ class LaneTrackerAgent:
         pred3 = np.array([pred[0], pred[1], 0.0], dtype=np.float64)
         return unit(pred3)
 
-    def _candidate_is_allowed(self, candidate_center: np.ndarray, prev_center: np.ndarray, prev_dir: np.ndarray) -> bool:
-        step_ref = max(float(self.cfg["step_m"]), 1e-6)
+    def _candidate_is_allowed(
+        self,
+        candidate_center: np.ndarray,
+        prev_center: np.ndarray,
+        prev_dir: np.ndarray,
+        step_distance_m: float,
+        candidate_kind: str | None = None,
+    ) -> bool:
+        step_ref = max(float(step_distance_m), 1e-6)
         prev_dir_xy = unit(prev_dir[:2])
         pred_xy = prev_center[:2] + prev_dir_xy * step_ref
         normal_xy = np.array([-prev_dir_xy[1], prev_dir_xy[0]], dtype=np.float64)
         lateral_offset = abs(float(np.dot(candidate_center[:2] - pred_xy, normal_xy)))
         hard_limit = float(self.cfg.get("hard_center_offset_limit_m", self.cfg.get("center_offset_tolerance_m", 0.18) * 1.4))
+        if candidate_kind == "recovery":
+            hard_limit = max(
+                hard_limit,
+                float(self.cfg.get("recovery_hard_center_offset_limit_m", hard_limit * 3.5)),
+            )
         if lateral_offset > hard_limit:
             return False
 
@@ -330,36 +393,397 @@ class LaneTrackerAgent:
         tolerance = max(float(self.cfg.get("lane_loyalty_tolerance_m", self.cfg.get("center_offset_tolerance_m", 0.18) * 0.75)), 1e-3)
         return float(np.clip(1.0 - loyalty_offset / tolerance, 0.0, 1.0))
 
-    def _candidate_centers(self, center: np.ndarray, direction: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def _rotate_direction(self, direction: np.ndarray, delta_deg: float) -> np.ndarray:
         direction = unit(direction)
-        normal = np.array([-direction[1], direction[0], 0.0], dtype=np.float64)
-        step_m = float(self.cfg["step_m"])
-        half_w = float(self.cfg["search_half_width_m"])
-        f_count = int(self.cfg["search_forward_samples"])
-        l_count = int(self.cfg["search_lateral_samples"])
-
-        out: List[Tuple[np.ndarray, np.ndarray]] = []
-        forward_fracs = np.linspace(0.85, 1.15, f_count)
-        lateral_offsets = np.linspace(-half_w, half_w, l_count)
-        for ff in forward_fracs:
-            for lo in lateral_offsets:
-                c_xy = center[:2] + direction[:2] * (step_m * ff) + normal[:2] * lo
-                out.append((c_xy, direction.copy()))
-
-        # mild heading changes for curve following
-        max_delta = np.radians(float(self.cfg["max_heading_change_deg"]))
-        for delta in np.linspace(-max_delta, max_delta, 7):
-            if abs(delta) < 1e-9:
-                continue
-            cs = float(np.cos(delta))
-            sn = float(np.sin(delta))
-            d2 = np.array([
+        delta = np.radians(float(delta_deg))
+        cs = float(np.cos(delta))
+        sn = float(np.sin(delta))
+        rotated = np.array(
+            [
                 cs * direction[0] - sn * direction[1],
                 sn * direction[0] + cs * direction[1],
                 0.0,
-            ])
-            c_xy = center[:2] + d2[:2] * step_m
-            out.append((c_xy, unit(d2)))
+            ],
+            dtype=np.float64,
+        )
+        return unit(rotated)
+
+    def _estimate_curve_hint_deg(self, points: List[np.ndarray], fallback_dir: np.ndarray) -> float:
+        if len(points) < 4:
+            return 0.0
+        hist = np.asarray(points[-6:], dtype=np.float64)
+        deltas = hist[1:, :2] - hist[:-1, :2]
+        lengths = np.linalg.norm(deltas, axis=1)
+        valid = lengths > 1e-9
+        if np.count_nonzero(valid) < 2:
+            return 0.0
+        dirs = deltas[valid] / lengths[valid, None]
+        heading_steps = []
+        for i in range(1, dirs.shape[0]):
+            a = np.array([dirs[i - 1, 0], dirs[i - 1, 1], 0.0], dtype=np.float64)
+            b = np.array([dirs[i, 0], dirs[i, 1], 0.0], dtype=np.float64)
+            heading_steps.append(float(np.radians(np.clip(np.degrees(np.arctan2(a[0] * b[1] - a[1] * b[0], np.clip(np.dot(a[:2], b[:2]), -1.0, 1.0))), -45.0, 45.0))))
+        if not heading_steps:
+            return 0.0
+        heading_steps = np.asarray(heading_steps, dtype=np.float64)
+        weights = np.linspace(1.0, 2.0, heading_steps.size, dtype=np.float64)
+        hint_deg = float(np.degrees(np.sum(heading_steps * weights) / np.sum(weights)))
+        max_hint = float(self.cfg.get("curve_candidate_heading_max_deg", self.cfg.get("max_heading_change_deg", 5.0)))
+        if not np.isfinite(hint_deg):
+            return 0.0
+        return float(np.clip(hint_deg, -max_hint, max_hint))
+
+    def _recovery_trigger_active(self, session: TrackSession) -> bool:
+        if session.gap_accum > 0.0 or session.gap_steps > 0:
+            return True
+        if not session.scores:
+            return False
+        recent = np.asarray(session.scores[-min(len(session.scores), 4):], dtype=np.float64)
+        last_score = float(recent[-1])
+        recent_mean = float(np.mean(recent))
+        trigger = float(self.cfg.get("recovery_score_trigger", max(session.min_score + 0.18, 0.55)))
+        return last_score < trigger or recent_mean < (trigger + 0.04)
+
+    def _recovery_hold_remaining_m(self, session: TrackSession) -> float:
+        return max(float(session.recovery_hold_until_traveled - session.traveled), 0.0)
+
+    def _should_add_recovery_candidates(self, session: TrackSession) -> bool:
+        if self._recovery_trigger_active(session):
+            return True
+        return self._recovery_hold_remaining_m(session) > 1e-9
+
+    def _clear_recovery_hold(self, session: TrackSession) -> None:
+        session.recovery_hold_until_traveled = 0.0
+        session.recovery_lock_dir = None
+        session.recovery_release_streak = 0
+
+    def _update_recovery_hold(
+        self,
+        session: TrackSession,
+        accepted_score: float | None = None,
+        accepted_kind: str | None = None,
+        reacquired: bool = False,
+    ) -> None:
+        hold_distance = max(float(self.cfg.get("recovery_hold_distance_m", 0.0)), 0.0)
+        if hold_distance <= 0.0:
+            self._clear_recovery_hold(session)
+            return
+        if self._recovery_trigger_active(session):
+            session.recovery_hold_until_traveled = max(
+                float(session.recovery_hold_until_traveled),
+                float(session.traveled + hold_distance),
+            )
+            session.recovery_release_streak = 0
+            return
+        release_score = float(self.cfg.get("recovery_release_score", max(self.cfg.get("recovery_score_trigger", 0.55) + 0.07, 0.60)))
+        release_steps = max(int(self.cfg.get("recovery_release_steps", 2)), 1)
+        if accepted_kind == "recovery":
+            if reacquired and bool(self.cfg.get("recovery_release_on_capture", True)):
+                self._clear_recovery_hold(session)
+                return
+            session.recovery_release_streak = 0
+        elif reacquired and accepted_score is not None and accepted_score >= release_score:
+            session.recovery_release_streak += 1
+            if session.recovery_release_streak >= release_steps:
+                self._clear_recovery_hold(session)
+                return
+        else:
+            session.recovery_release_streak = 0
+        if session.traveled >= session.recovery_hold_until_traveled:
+            self._clear_recovery_hold(session)
+
+    def _recovery_reacquired(
+        self,
+        accepted_score: float,
+        accepted_kind: str | None,
+        cross_section_profile: TrackCrossSectionProfileDebug | None,
+    ) -> bool:
+        release_score = float(self.cfg.get("recovery_release_score", max(self.cfg.get("recovery_score_trigger", 0.55) + 0.07, 0.60)))
+        if accepted_score < release_score:
+            return False
+        if cross_section_profile is None or cross_section_profile.selected_idx is None:
+            return False
+        if not cross_section_profile.stripe_candidates:
+            return False
+        stripe = cross_section_profile.stripe_candidates[cross_section_profile.selected_idx]
+        stripe_release_score = float(self.cfg.get("recovery_release_stripe_score", 0.62))
+        stripe_center_limit = float(
+            self.cfg.get(
+                "recovery_release_center_limit_m",
+                self.cfg.get("lane_half_width_m", 0.09) * 0.9,
+            )
+        )
+        return (
+            float(stripe.selection_score) >= stripe_release_score
+            and abs(float(stripe.center_m)) <= max(stripe_center_limit, 0.03)
+        )
+
+    def _recovery_hook_ready(
+        self,
+        proposal_score: float,
+        proposal_kind: str | None,
+        cross_section_profile: TrackCrossSectionProfileDebug | None,
+    ) -> bool:
+        if proposal_kind != "recovery":
+            return False
+        hook_score = float(
+            self.cfg.get(
+                "recovery_hook_score",
+                max(
+                    float(self.cfg.get("recovery_release_score", 0.60)),
+                    float(self.cfg.get("recovery_score_trigger", 0.55)) + 0.07,
+                ),
+            )
+        )
+        if proposal_score >= hook_score:
+            return True
+        if cross_section_profile is None or cross_section_profile.selected_idx is None:
+            return False
+        if not cross_section_profile.stripe_candidates:
+            return False
+        stripe = cross_section_profile.stripe_candidates[cross_section_profile.selected_idx]
+        hook_stripe_score = float(self.cfg.get("recovery_hook_stripe_score", 0.58))
+        hook_center_limit = float(
+            self.cfg.get(
+                "recovery_hook_center_limit_m",
+                self.cfg.get("lane_half_width_m", 0.09) * 1.2,
+            )
+        )
+        return (
+            float(stripe.selection_score) >= hook_stripe_score
+            and abs(float(stripe.center_m)) <= max(hook_center_limit, 0.03)
+        )
+
+    def _search_direction_for_session(self, session: TrackSession, predicted_dir: np.ndarray) -> np.ndarray:
+        predicted_dir = unit(predicted_dir)
+        if not self._should_add_recovery_candidates(session):
+            return predicted_dir
+
+        if bool(self.cfg.get("recovery_force_straight_direction", True)):
+            if session.recovery_lock_dir is None or float(np.linalg.norm(session.recovery_lock_dir[:2])) <= 1e-9:
+                base_dir = session.cur_dir if float(np.linalg.norm(session.cur_dir[:2])) > 1e-9 else predicted_dir
+                session.recovery_lock_dir = unit(base_dir).copy()
+            return unit(session.recovery_lock_dir)
+
+        return predicted_dir
+
+    def _apply_recovery_steering(
+        self,
+        session: TrackSession,
+        target_center: np.ndarray,
+        target_dir: np.ndarray,
+        proposal: CandidateProposal | None,
+        proposal_score: float,
+        hook_ready: bool,
+        hook_profile: TrackCrossSectionProfileDebug | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if proposal is None or proposal.kind != "recovery":
+            return target_center, unit(target_dir)
+
+        step_scale = max(float(self.cfg.get("recovery_advance_max_scale", 1.0)), 0.1)
+        max_advance = max(float(session.step_m) * step_scale, 1e-6)
+        max_turn_deg = max(float(self.cfg.get("recovery_turn_max_deg", 12.0)), 0.5)
+        max_lateral_snap = max(float(self.cfg.get("recovery_lateral_snap_max_m", 0.10)), 0.0)
+        lateral_snap_ratio = float(np.clip(self.cfg.get("recovery_lateral_snap_ratio", 0.55), 0.0, 1.0))
+        hook_turn_deg = max(float(self.cfg.get("recovery_hook_turn_max_deg", max_turn_deg * 1.5)), max_turn_deg)
+        hook_lateral_snap = max(float(self.cfg.get("recovery_hook_lateral_snap_max_m", max_lateral_snap * 1.5)), max_lateral_snap)
+        hook_lateral_ratio = float(
+            np.clip(
+                self.cfg.get("recovery_hook_lateral_snap_ratio", max(lateral_snap_ratio, 0.75)),
+                0.0,
+                1.0,
+            )
+        )
+        capture_snap_distance = max(float(self.cfg.get("recovery_capture_snap_distance_m", max(float(session.step_m) * 3.5, 1.2))), max_advance)
+        capture_advance = max(float(self.cfg.get("recovery_capture_advance_scale", 1.75)) * float(session.step_m), max_advance)
+        capture_lateral_snap = max(float(self.cfg.get("recovery_capture_lateral_snap_max_m", max(hook_lateral_snap, 0.45))), hook_lateral_snap)
+        capture_lateral_ratio = float(np.clip(self.cfg.get("recovery_capture_lateral_snap_ratio", 1.0), 0.0, 1.0))
+        delta_xy = np.asarray(target_center[:2] - session.cur[:2], dtype=np.float64)
+        distance = float(np.linalg.norm(delta_xy))
+        base_dir = session.recovery_lock_dir if session.recovery_lock_dir is not None else session.cur_dir
+        base_dir = unit(base_dir if float(np.linalg.norm(base_dir[:2])) > 1e-9 else target_dir)
+        base_dir_xy = unit(base_dir[:2])
+        base_normal_xy = np.array([-base_dir_xy[1], base_dir_xy[0]], dtype=np.float64)
+
+        # During true gap recovery, keep advancing on the locked straight axis.
+        # Only switch into hook mode once the recovery candidate is strong enough.
+        if not hook_ready:
+            straight_center = np.asarray(target_center, dtype=np.float64).copy()
+            straight_center[:2] = session.cur[:2] + base_dir_xy * max_advance
+            return straight_center, base_dir
+
+        capture_dir = unit(target_dir if float(np.linalg.norm(target_dir[:2])) > 1e-9 else np.array([delta_xy[0], delta_xy[1], 0.0], dtype=np.float64))
+        capture_dir_xy = unit(capture_dir[:2])
+        capture_normal_xy = np.array([-capture_dir_xy[1], capture_dir_xy[0]], dtype=np.float64)
+        capture_center = np.asarray(target_center, dtype=np.float64).copy()
+        if (
+            hook_profile is not None
+            and hook_profile.selected_idx is not None
+            and hook_profile.stripe_candidates
+        ):
+            stripe = hook_profile.stripe_candidates[hook_profile.selected_idx]
+            capture_center_shift_max = max(
+                float(
+                    self.cfg.get(
+                        "recovery_capture_center_shift_max_m",
+                        max(float(self.cfg.get("lane_half_width_m", 0.09)) * 2.0, 0.18),
+                    )
+                ),
+                0.03,
+            )
+            stripe_shift = float(np.clip(stripe.center_m, -capture_center_shift_max, capture_center_shift_max))
+            capture_center[:2] = capture_center[:2] + capture_normal_xy * stripe_shift
+            delta_xy = np.asarray(capture_center[:2] - session.cur[:2], dtype=np.float64)
+            distance = float(np.linalg.norm(delta_xy))
+        if distance <= capture_snap_distance + 1e-9:
+            return capture_center, capture_dir
+
+        capture_along = float(np.dot(delta_xy, capture_dir_xy))
+        capture_lateral_error = float(np.dot(delta_xy, capture_normal_xy))
+        capture_forward = float(np.clip(capture_along, 0.0, capture_advance))
+        lateral_snap = float(np.clip(capture_lateral_error * capture_lateral_ratio, -capture_lateral_snap, capture_lateral_snap))
+        capture_center[:2] = session.cur[:2] + capture_dir_xy * capture_forward + capture_normal_xy * lateral_snap
+        return capture_center, capture_dir
+
+    def _candidate_centers(self, session: TrackSession, direction: np.ndarray) -> List[CandidateProposal]:
+        direction = unit(direction)
+        center = session.cur
+        step_m = float(session.step_m)
+        hard_limit = float(self.cfg.get("hard_center_offset_limit_m", self.cfg.get("center_offset_tolerance_m", 0.18) * 1.4))
+        search_cap = float(self.cfg.get("search_half_width_m", hard_limit))
+        recovery_active = self._should_add_recovery_candidates(session)
+        recovery_force_straight = bool(self.cfg.get("recovery_force_straight_direction", True))
+
+        center_half = min(float(self.cfg.get("candidate_center_half_width_m", 0.12)), hard_limit, search_cap)
+        curve_half = min(float(self.cfg.get("candidate_curve_half_width_m", max(center_half * 0.75, 0.08))), hard_limit, search_cap)
+        recovery_half = min(float(self.cfg.get("candidate_recovery_half_width_m", max(center_half * 1.2, 0.15))), hard_limit, search_cap)
+
+        curve_hint_deg = 0.0 if (recovery_active and recovery_force_straight) else self._estimate_curve_hint_deg(session.points, direction)
+        curve_heading_step = float(self.cfg.get("curve_candidate_heading_step_deg", max(float(self.cfg.get("max_heading_change_deg", 5.0)) * 0.5, 2.5)))
+        curve_heading_max = float(self.cfg.get("curve_candidate_heading_max_deg", self.cfg.get("max_heading_change_deg", 5.0)))
+        recovery_heading_step = float(self.cfg.get("recovery_candidate_heading_step_deg", max(curve_heading_step * 1.6, 4.5)))
+        recovery_heading_max = float(self.cfg.get("recovery_candidate_heading_max_deg", max(curve_heading_max * 2.0, recovery_heading_step * 3.0)))
+        recovery_heading_levels = max(int(self.cfg.get("recovery_heading_levels", 3)), 1)
+
+        center_rows = [
+            (0.82, [0.0, -center_half * 0.70, center_half * 0.70, -center_half, center_half]),
+            (1.00, [0.0, -center_half * 0.45, center_half * 0.45]),
+            (1.18, [0.0]),
+        ]
+
+        if abs(curve_hint_deg) < curve_heading_step * 0.5:
+            curve_headings = [-curve_heading_step, curve_heading_step]
+        else:
+            curve_headings = [curve_hint_deg - curve_heading_step, curve_hint_deg, curve_hint_deg + curve_heading_step]
+        curve_headings = sorted(
+            {
+                float(np.clip(delta_deg, -curve_heading_max, curve_heading_max))
+                for delta_deg in curve_headings
+            }
+        )
+        curve_rows = [
+            (0.98, [0.0, -curve_half * 0.75, curve_half * 0.75]),
+            (1.28, [0.0]),
+        ]
+
+        recovery_forward_max = float(self.cfg.get("recovery_forward_max_distance_m", max(step_m * 3.0, 2.5)))
+        recovery_forward_near = min(max(step_m * 1.2, step_m * 1.0), recovery_forward_max)
+        recovery_forward_mid = min(max(step_m * 2.1, recovery_forward_near + step_m * 0.8), recovery_forward_max)
+        recovery_forward_far = min(max(step_m * 3.2, recovery_forward_mid + step_m), recovery_forward_max)
+        recovery_rows = [
+            (recovery_forward_near, [0.0]),
+            (recovery_forward_mid, [0.0]),
+            (recovery_forward_far, [0.0]),
+            (recovery_forward_max, [0.0]),
+        ]
+
+        out: List[CandidateProposal] = []
+        seen: set[tuple[int, int, int, int]] = set()
+
+        def add_candidate(
+            base_direction: np.ndarray,
+            step_distance_m: float,
+            lateral_offset: float,
+            kind: str,
+            heading_delta_deg: float,
+            score_scale: float,
+        ) -> None:
+            cand_dir = unit(base_direction)
+            normal = np.array([-cand_dir[1], cand_dir[0], 0.0], dtype=np.float64)
+            c_xy = center[:2] + cand_dir[:2] * float(step_distance_m) + normal[:2] * float(lateral_offset)
+            key = (
+                int(round(float(c_xy[0]) * 1000.0)),
+                int(round(float(c_xy[1]) * 1000.0)),
+                int(round(float(cand_dir[0]) * 10000.0)),
+                int(round(float(cand_dir[1]) * 10000.0)),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(
+                CandidateProposal(
+                    center_xy=np.asarray(c_xy, dtype=np.float64),
+                    direction=cand_dir,
+                    kind=kind,
+                    step_distance_m=float(step_distance_m),
+                    heading_delta_deg=float(heading_delta_deg),
+                    lateral_offset_m=float(lateral_offset),
+                    score_scale=float(score_scale),
+                )
+            )
+
+        if not recovery_active:
+            for forward_scale, lateral_offsets in center_rows:
+                step_distance = step_m * float(forward_scale)
+                for lateral_offset in lateral_offsets:
+                    add_candidate(
+                        direction,
+                        step_distance,
+                        lateral_offset,
+                        "center",
+                        0.0,
+                        float(self.cfg.get("center_candidate_score_scale", 1.0)),
+                    )
+
+            for delta_deg in curve_headings:
+                curve_dir = self._rotate_direction(direction, delta_deg)
+                for forward_scale, lateral_offsets in curve_rows:
+                    step_distance = step_m * float(forward_scale)
+                    for lateral_offset in lateral_offsets:
+                        add_candidate(
+                            curve_dir,
+                            step_distance,
+                            lateral_offset,
+                            "curve",
+                            delta_deg,
+                            float(self.cfg.get("curve_candidate_score_scale", 0.99)),
+                        )
+
+        if recovery_active:
+            recovery_center = 0.0 if recovery_force_straight else float(np.clip(curve_hint_deg, -recovery_heading_max, recovery_heading_max))
+            recovery_headings = [
+                recovery_center + recovery_heading_step * level
+                for level in range(-recovery_heading_levels, recovery_heading_levels + 1)
+            ]
+            recovery_headings = sorted(
+                {
+                    float(np.clip(delta_deg, -recovery_heading_max, recovery_heading_max))
+                    for delta_deg in recovery_headings
+                }
+            )
+            for delta_deg in recovery_headings:
+                recovery_dir = self._rotate_direction(direction, delta_deg)
+                for step_distance, lateral_offsets in recovery_rows:
+                    for lateral_offset in lateral_offsets:
+                        add_candidate(
+                            recovery_dir,
+                            step_distance,
+                            lateral_offset,
+                            "recovery",
+                            delta_deg,
+                            float(self.cfg.get("recovery_candidate_score_scale", 0.97)),
+                        )
+
         return out
 
     def _refine_center_xy(self, center: np.ndarray, direction: np.ndarray) -> np.ndarray:
@@ -635,14 +1059,17 @@ class LaneTrackerAgent:
     def _evaluate_step_candidates(
         self,
         session: TrackSession,
-    ) -> Tuple[np.ndarray, float, np.ndarray | None, np.ndarray | None, List[Dict[str, Any]]]:
-        pred_dir = self._predict_direction(session.points, session.cur_dir)
+    ) -> Tuple[np.ndarray, float, np.ndarray | None, np.ndarray | None, CandidateProposal | None, List[Dict[str, Any]]]:
+        pred_dir = self._search_direction_for_session(session, self._predict_direction(session.points, session.cur_dir))
         best_score = -1.0
         best_center = None
         best_dir = None
+        best_proposal = None
         candidates_debug: List[Dict[str, Any]] = []
 
-        for c_xy, c_dir in self._candidate_centers(session.cur, pred_dir):
+        for proposal in self._candidate_centers(session, pred_dir):
+            c_xy = proposal.center_xy
+            c_dir = proposal.direction
             idx = self.grid.query_radius_xy(c_xy, session.query_r)
             c_z = self._fit_center_z(c_xy, session.query_r, session.cur[2])
             center3 = np.array([c_xy[0], c_xy[1], c_z], dtype=np.float64)
@@ -653,13 +1080,17 @@ class LaneTrackerAgent:
             else:
                 mean_intensity = 0.0
                 high_intensity = 0.0
-            allowed = self._candidate_is_allowed(center3, session.cur, pred_dir)
+            allowed = self._candidate_is_allowed(center3, session.cur, pred_dir, proposal.step_distance_m, proposal.kind)
             if not allowed:
                 candidates_debug.append(
                     {
                         "x": float(center3[0]),
                         "y": float(center3[1]),
                         "z": float(center3[2]),
+                        "kind": proposal.kind,
+                        "step_distance_m": float(proposal.step_distance_m),
+                        "heading_delta_deg": float(proposal.heading_delta_deg),
+                        "lateral_offset_m": float(proposal.lateral_offset_m),
                         "score": -1.0,
                         "mean_intensity": mean_intensity,
                         "high_intensity": high_intensity,
@@ -667,6 +1098,25 @@ class LaneTrackerAgent:
                     }
                 )
                 continue
+            score_cfg = self.cfg
+            if proposal.kind == "recovery":
+                score_cfg = dict(self.cfg)
+                score_cfg["center_pull_weight"] = float(self.cfg.get("recovery_center_pull_weight", 0.15))
+                score_cfg["straight_bias_weight"] = float(
+                    self.cfg.get(
+                        "recovery_straight_bias_weight",
+                        float(self.cfg.get("straight_bias_weight", 0.30)) * 0.25,
+                    )
+                )
+                score_cfg["max_heading_change_deg"] = float(
+                    self.cfg.get(
+                        "recovery_scoring_heading_deg",
+                        max(
+                            float(self.cfg.get("recovery_candidate_heading_max_deg", 13.5)),
+                            float(self.cfg.get("max_heading_change_deg", 5.0)),
+                        ),
+                    )
+                )
             sc = score_candidate(
                 candidate_center=center3,
                 candidate_dir=c_dir,
@@ -676,16 +1126,27 @@ class LaneTrackerAgent:
                 intensity=self.intensity,
                 indices=idx,
                 seed_profile=session.profile,
-                cfg=self.cfg,
+                cfg=score_cfg,
+                step_reference_m=proposal.step_distance_m,
             )
             loyalty_term = self._lane_loyalty_term(session.points, center3, pred_dir)
-            loyalty_weight = float(self.cfg.get("lane_loyalty_weight", 0.0))
+            loyalty_weight = float(
+                self.cfg.get(
+                    "recovery_lane_loyalty_weight",
+                    0.10,
+                )
+            ) if proposal.kind == "recovery" else float(self.cfg.get("lane_loyalty_weight", 0.0))
             sc *= (1.0 - loyalty_weight) + loyalty_weight * loyalty_term
+            sc *= float(proposal.score_scale)
             candidates_debug.append(
                 {
                     "x": float(center3[0]),
                     "y": float(center3[1]),
                     "z": float(center3[2]),
+                    "kind": proposal.kind,
+                    "step_distance_m": float(proposal.step_distance_m),
+                    "heading_delta_deg": float(proposal.heading_delta_deg),
+                    "lateral_offset_m": float(proposal.lateral_offset_m),
                     "score": float(sc),
                     "mean_intensity": mean_intensity,
                     "high_intensity": high_intensity,
@@ -696,8 +1157,9 @@ class LaneTrackerAgent:
                 best_score = sc
                 best_center = center3
                 best_dir = c_dir
+                best_proposal = proposal
 
-        return pred_dir, float(best_score), best_center, best_dir, candidates_debug
+        return pred_dir, float(best_score), best_center, best_dir, best_proposal, candidates_debug
 
     def _make_step_debug(
         self,

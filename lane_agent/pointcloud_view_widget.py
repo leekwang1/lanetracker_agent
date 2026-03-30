@@ -190,6 +190,94 @@ class PointCloudViewWidget(QtWidgets.QWidget):
         if self.plotter is not None:
             self.plotter.render()
 
+    def _poly_point_count(self, poly: object | None) -> int:
+        if poly is None:
+            return 0
+        try:
+            return int(poly.n_points)
+        except Exception:
+            try:
+                return int(poly.number_of_points)
+            except Exception:
+                return -1
+
+    def _actor_state(self, actor) -> str:
+        if actor is None:
+            return "none"
+        try:
+            return "on" if bool(actor.GetVisibility()) else "off"
+        except Exception:
+            return "unknown"
+
+    def _camera_state_text(self) -> str:
+        if self.plotter is None:
+            return "camera=none"
+        try:
+            camera = self.plotter.camera
+            focal = camera.GetFocalPoint()
+            scale = float(camera.GetParallelScale())
+            return f"camera=({focal[0]:.3f}, {focal[1]:.3f}) scale={scale:.3f}"
+        except Exception as exc:
+            return f"camera=error({exc!r})"
+
+    def _poly_bounds_text(self, poly: object | None) -> str:
+        if poly is None:
+            return "bounds=-"
+        try:
+            bounds = poly.bounds
+            if bounds is None:
+                return "bounds=-"
+            x0, x1, y0, y1, z0, z1 = [float(v) for v in bounds]
+            return (
+                "bounds="
+                f"x=({x0 + self._origin_xyz[0]:.3f}, {x1 + self._origin_xyz[0]:.3f}) "
+                f"y=({y0 + self._origin_xyz[1]:.3f}, {y1 + self._origin_xyz[1]:.3f}) "
+                f"z=({z0 + self._origin_xyz[2]:.3f}, {z1 + self._origin_xyz[2]:.3f})"
+            )
+        except Exception as exc:
+            return f"bounds=error({exc!r})"
+
+    def _log_overlay_state(self, source: str) -> None:
+        if not self._log_visible_refresh:
+            return
+        self.debug_message.emit(
+            f"{source} overlay | "
+            f"track={self._poly_point_count(self._track_poly)}/{self._actor_state(self._track_actor)} | "
+            f"pred={self._poly_point_count(self._pred_poly)}/{self._actor_state(self._pred_actor)} | "
+            f"box={self._poly_point_count(self._search_box_poly)}/{self._actor_state(self._search_box_actor)} | "
+            f"current={self._poly_point_count(self._current_poly)}/{self._actor_state(self._current_actor)} | "
+            f"{self._camera_state_text()}"
+        )
+
+    def _raise_overlay_actors(self) -> None:
+        if self.plotter is None:
+            return
+        renderer = getattr(self.plotter, "renderer", None)
+        if renderer is None:
+            return
+        overlay_actor_names = [
+            "_seed_line_actor",
+            "_seed_p0_actor",
+            "_seed_p1_actor",
+            "_track_actor",
+            "_current_actor",
+            "_pred_actor",
+            "_trajectory_line_actor",
+            "_profile_line_actor",
+            "_stripe_segment_actor",
+            "_stripe_edge_actor",
+            "_search_box_actor",
+        ]
+        for actor_name in overlay_actor_names:
+            actor = getattr(self, actor_name, None)
+            if actor is None:
+                continue
+            try:
+                renderer.RemoveActor(actor)
+                renderer.AddActor(actor)
+            except Exception as exc:
+                self.debug_message.emit(f"raise overlay failed for {actor_name}: {exc!r}")
+
     def focus_on_point(self, point_xyz: np.ndarray | None, view_width_m: float = 9.0) -> None:
         if self.plotter is None or point_xyz is None:
             return
@@ -209,6 +297,7 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             camera.SetParallelScale(max(float(view_width_m) * 0.5, 1.0))
             self._view_rect_cache = None
             self._refresh_visible_points(force=True)
+            self._log_overlay_state("focus_on_point")
             self.plotter.render()
         except Exception as exc:
             self.debug_message.emit(f"focus_on_point failed: {exc!r}")
@@ -235,6 +324,11 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             render_lines_as_tubes=False,
             reset_camera=False,
         )
+        if self._log_visible_refresh:
+            self.debug_message.emit(
+                f"set_track | n={self._poly_point_count(self._track_poly)} | {self._poly_bounds_text(self._track_poly)}"
+            )
+            self._log_overlay_state("set_track")
         if render:
             self.plotter.render()
 
@@ -308,6 +402,11 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             point_size=12,
             reset_camera=False,
         )
+        if self._log_visible_refresh:
+            self.debug_message.emit(
+                f"set_current | n={self._poly_point_count(self._current_poly)} | {self._poly_bounds_text(self._current_poly)}"
+            )
+            self._log_overlay_state("set_current")
         if render:
             self.plotter.render()
 
@@ -334,6 +433,11 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             opacity=0.7,
             reset_camera=False,
         )
+        if self._log_visible_refresh:
+            self.debug_message.emit(
+                f"set_predicted | n={self._poly_point_count(self._pred_poly)} | {self._poly_bounds_text(self._pred_poly)}"
+            )
+            self._log_overlay_state("set_predicted")
         if render:
             self.plotter.render()
 
@@ -447,6 +551,11 @@ class PointCloudViewWidget(QtWidgets.QWidget):
             render_lines_as_tubes=False,
             reset_camera=False,
         )
+        if self._log_visible_refresh:
+            self.debug_message.emit(
+                f"set_search_box | n={self._poly_point_count(self._search_box_poly)} | {self._poly_bounds_text(self._search_box_poly)}"
+            )
+            self._log_overlay_state("set_search_box")
         if render:
             self.plotter.render()
 
@@ -668,6 +777,8 @@ class PointCloudViewWidget(QtWidgets.QWidget):
                 f"area_ratio={area_ratio:.5f}, mode={sample_mode}, "
                 f"rect=({x0:.3f}, {x1:.3f}, {y0:.3f}, {y1:.3f}), t={elapsed:.3f}s"
             )
+        self._raise_overlay_actors()
+        self._log_overlay_state("visible_refresh")
         self.plotter.render()
 
     def _current_view_rect_xy(self) -> tuple[float, float, float, float] | None:
@@ -759,3 +870,4 @@ class PointCloudViewWidget(QtWidgets.QWidget):
     def set_view_log_enabled(self, enabled: bool) -> None:
         self._log_visible_refresh = bool(enabled)
         self.debug_message.emit(f"View log {'enabled' if enabled else 'disabled'}")
+        self._log_overlay_state("view_log_toggle")
